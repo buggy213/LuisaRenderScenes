@@ -11,14 +11,15 @@ import glob
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-BINARY = REPO_ROOT / "cmake-build-release" / "bin" / "luisa-render-cli"
+REPO_ROOT = Path(__file__).resolve().parent
+BINARY = "luisa-render-cli"
 
 # Default integrator properties
 INTEGRATOR_DEFAULTS = {
@@ -67,6 +68,40 @@ def make_integrator_block(integrator_type: str, samples_per_pass: int | None = N
     return "\n".join(lines)
 
 
+def _find_balanced_brace_end(text: str, open_pos: int) -> int:
+    """Given position of an opening '{', return position of its matching '}'."""
+    depth = 0
+    for i in range(open_pos, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _replace_braced_block(text: str, pattern: str, replacement: str) -> str:
+    """Find `pattern` followed by a braced block `{ ... }` and replace the whole thing.
+
+    Uses brace counting to correctly handle arbitrarily nested braces.
+    """
+    m = re.search(pattern, text)
+    if not m:
+        return text
+    # Find the opening brace after the match
+    rest = text[m.end():]
+    brace_offset = rest.find('{')
+    if brace_offset == -1:
+        return text
+    open_pos = m.end() + brace_offset
+    close_pos = _find_balanced_brace_end(text, open_pos)
+    if close_pos == -1:
+        return text
+    # Replace from start of match through closing brace
+    return text[:m.start()] + replacement + text[close_pos + 1:]
+
+
 def rewrite_scene(scene_content: str, integrator_block: str) -> str:
     """Rewrite the integrator in a scene file.
 
@@ -74,20 +109,18 @@ def rewrite_scene(scene_content: str, integrator_block: str) -> str:
     1. Inline: `integrator : Type { ... }` inside render block
     2. Named: `Integrator name : Type { ... }` as top-level + `integrator { @name }` in render
     """
-    # Remove top-level named integrator definitions
-    # Pattern: Integrator <name> : <Type> { ... }
-    scene_content = re.sub(
-        r'Integrator\s+\w+\s*:\s*\w+\s*\{[^}]*(?:\{[^}]*\}[^}]*)*\}\s*\n?',
-        '',
-        scene_content
+    # Remove top-level named integrator definitions: Integrator <name> : <Type> { ... }
+    scene_content = _replace_braced_block(
+        scene_content,
+        r'Integrator\s+\w+\s*:\s*\w+\s*',
+        ''
     )
 
-    # Replace inline integrator block (with nested braces)
-    # Match: integrator : Type { ... } handling one level of nesting
-    replaced = re.sub(
-        r'integrator\s*:\s*\w+\s*\{[^}]*(?:\{[^}]*\}[^}]*)*\}',
-        integrator_block.strip(),
-        scene_content
+    # Replace inline integrator: integrator : Type { ... }
+    replaced = _replace_braced_block(
+        scene_content,
+        r'integrator\s*:\s*\w+\s*',
+        integrator_block.strip()
     )
 
     # Replace reference-style integrator: integrator { @name }
@@ -115,10 +148,27 @@ def write_temp_scene(scene_file: Path, content: str) -> Path:
     return tmp_path
 
 
-def run_render(binary: Path, backend: str, scene_path: Path, device: int = 0,
-               timeout: int | None = None) -> tuple[float, bool, str]:
-    """Run the renderer and return (elapsed_seconds, success, output)."""
-    cmd = [str(binary), "-b", backend, "-d", str(device), "--scene", str(scene_path)]
+def parse_render_times(output: str) -> dict:
+    """Parse timing information from renderer output.
+
+    Returns dict with:
+      render_ms: rendering time in ms (from "Rendering finished in X ms.")
+      compile_ms: shader compile time in ms (from "Integrator shader compile in X ms.")
+    """
+    times = {}
+    m = re.search(r'Rendering finished in ([\d.]+) ms', output)
+    if m:
+        times["render_ms"] = float(m.group(1))
+    m = re.search(r'Integrator shader compile in ([\d.]+) ms', output)
+    if m:
+        times["compile_ms"] = float(m.group(1))
+    return times
+
+
+def run_render(binary: str, backend: str, scene_path: Path, device: int = 0,
+               timeout: int | None = None) -> dict:
+    """Run the renderer and return a result dict."""
+    cmd = [binary, "-b", backend, "-d", str(device), "--scene", str(scene_path)]
     start = time.monotonic()
     try:
         result = subprocess.run(
@@ -127,19 +177,61 @@ def run_render(binary: Path, backend: str, scene_path: Path, device: int = 0,
         )
         elapsed = time.monotonic() - start
         output = result.stdout + result.stderr
-        return elapsed, result.returncode == 0, output
-    except subprocess.TimeoutExpired:
+        times = parse_render_times(output)
+        return {
+            "elapsed": elapsed,
+            "ok": result.returncode == 0,
+            "returncode": result.returncode,
+            "cmd": cmd,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            **times,
+        }
+    except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - start
-        return elapsed, False, "TIMEOUT"
+        return {
+            "elapsed": elapsed,
+            "ok": False,
+            "returncode": None,
+            "cmd": cmd,
+            "stdout": e.stdout or "",
+            "stderr": e.stderr or "",
+            "timeout": True,
+        }
+
+
+def print_render_failure(r: dict):
+    """Print detailed failure info for a render run."""
+    print(f"  Command: {' '.join(r['cmd'])}")
+    if r.get("timeout"):
+        print(f"  TIMEOUT after {r['elapsed']:.1f}s")
+    else:
+        print(f"  Exit code: {r['returncode']}")
+    if r["stderr"].strip():
+        print(f"  Stderr:\n    " + "\n    ".join(r["stderr"].strip().splitlines()[-30:]))
+    if r["stdout"].strip():
+        print(f"  Stdout:\n    " + "\n    ".join(r["stdout"].strip().splitlines()[-15:]))
+
+
+def _fmt_ms(ms):
+    """Format milliseconds as a human-readable string."""
+    if ms is None:
+        return "-"
+    if ms >= 1000:
+        return f"{ms / 1000:.2f}s"
+    return f"{ms:.1f}ms"
 
 
 def print_table(results: list[dict]):
     """Print results as a formatted table."""
     if not results:
         return
-    headers = ["Scene", "Integrator", "spp_per_pass", "use_ser", "Time (s)", "Status"]
-    col_widths = [max(len(headers[i]), max(len(str(r.get(h, ""))) for r in results))
-                  for i, h in enumerate(["scene", "integrator", "samples_per_pass", "use_ser", "time", "status"])]
+    headers = ["Scene", "Integrator", "spp_per_pass", "use_ser",
+               "Render", "Compile", "Wall", "Status"]
+    keys = ["scene", "integrator", "samples_per_pass", "use_ser",
+            "render_ms", "compile_ms", "wall_ms", "status"]
+    col_widths = [max(len(headers[i]), max(len(str(r.get(k, ""))) for r in results))
+                  for i, k in enumerate(keys)]
 
     def fmt_row(vals):
         return " | ".join(str(v).ljust(w) for v, w in zip(vals, col_widths))
@@ -148,12 +240,14 @@ def print_table(results: list[dict]):
     print(fmt_row(headers))
     print("-+-".join("-" * w for w in col_widths))
     for r in results:
-        t = f"{r['time']:.1f}" if r['status'] == 'ok' else r['status']
         print(fmt_row([
             r['scene'], r['integrator'],
             r.get('samples_per_pass', '-'),
             r.get('use_ser', '-'),
-            t, r['status']
+            _fmt_ms(r.get('render_ms')),
+            _fmt_ms(r.get('compile_ms')),
+            _fmt_ms(r.get('wall_ms')),
+            r['status'],
         ]))
     print()
 
@@ -174,10 +268,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     args = parser.parse_args()
 
-    binary = Path(args.binary) if args.binary else BINARY
-    if not binary.exists():
-        print(f"Error: binary not found at {binary}", file=sys.stderr)
-        print("Build with cmake first, or pass --binary <path>", file=sys.stderr)
+    binary = args.binary if args.binary else BINARY
+    if not shutil.which(binary):
+        print(f"Error: binary '{binary}' not found in PATH", file=sys.stderr)
+        print("Install luisa-render-cli or pass --binary <path>", file=sys.stderr)
         sys.exit(1)
 
     scenes_dir = REPO_ROOT / "scenes"
@@ -214,15 +308,19 @@ def main():
             if args.dry_run:
                 print(f"(dry run) cmd: {binary} -b {args.backend} --scene {tmp}")
             else:
-                elapsed, ok, output = run_render(binary, args.backend, tmp, args.device, args.timeout)
-                status = "ok" if ok else "FAIL"
-                print(f"{elapsed:.1f}s [{status}]")
-                if not ok:
-                    print(f"  Output: {output[-500:]}")
+                r = run_render(binary, args.backend, tmp, args.device, args.timeout)
+                status = "ok" if r["ok"] else ("TIMEOUT" if r.get("timeout") else "FAIL")
+                render_str = _fmt_ms(r.get("render_ms")) if r.get("render_ms") else f"{r['elapsed']:.1f}s (wall)"
+                print(f"{render_str} [{status}]")
+                if not r["ok"]:
+                    print_render_failure(r)
                 results.append({
                     "scene": name, "integrator": "WavePath",
                     "samples_per_pass": "-", "use_ser": "-",
-                    "time": elapsed, "status": status,
+                    "render_ms": r.get("render_ms"),
+                    "compile_ms": r.get("compile_ms"),
+                    "wall_ms": r["elapsed"] * 1000,
+                    "status": status,
                 })
 
             # --- MegaPath runs ---
@@ -251,17 +349,21 @@ def main():
                 if args.dry_run:
                     print(f"(dry run)")
                 else:
-                    elapsed, ok, output = run_render(
+                    r = run_render(
                         binary, args.backend, tmp, args.device, args.timeout
                     )
-                    status = "ok" if ok else "FAIL"
-                    print(f"{elapsed:.1f}s [{status}]")
-                    if not ok:
-                        print(f"  Output: {output[-500:]}")
+                    status = "ok" if r["ok"] else ("TIMEOUT" if r.get("timeout") else "FAIL")
+                    render_str = _fmt_ms(r.get("render_ms")) if r.get("render_ms") else f"{r['elapsed']:.1f}s (wall)"
+                    print(f"{render_str} [{status}]")
+                    if not r["ok"]:
+                        print_render_failure(r)
                     results.append({
                         "scene": name, "integrator": "MegaPath",
                         "samples_per_pass": spp_val, "use_ser": ser_val,
-                        "time": elapsed, "status": status,
+                        "render_ms": r.get("render_ms"),
+                        "compile_ms": r.get("compile_ms"),
+                        "wall_ms": r["elapsed"] * 1000,
+                        "status": status,
                     })
 
     except KeyboardInterrupt:
@@ -281,7 +383,8 @@ def main():
         csv_path = Path(args.output)
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "scene", "integrator", "samples_per_pass", "use_ser", "time", "status"
+                "scene", "integrator", "samples_per_pass", "use_ser",
+                "render_ms", "compile_ms", "wall_ms", "status",
             ])
             writer.writeheader()
             writer.writerows(results)

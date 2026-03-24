@@ -1,4 +1,6 @@
 scenes/
+benchmark_results.csv
+__pycache__/
 
 ### VisualStudioCode template
 .vscode/*
