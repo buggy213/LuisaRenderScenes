@@ -229,7 +229,7 @@ examples:
     # --- Integrator ---
     integ = parser.add_argument_group("integrator")
     integ.add_argument("--integrator", "-i", default="WavePath",
-                       choices=["WavePath", "MegaPath", "WGPath"],
+                       choices=["WavePath", "MegaPath", "WGPath", "WavePath_v2"],
                        help="Integrator type (default: WavePath)")
     integ.add_argument("--depth", type=int, default=INTEGRATOR_DEFAULTS["depth"],
                        help=f"Ray depth (default: {INTEGRATOR_DEFAULTS['depth']})")
@@ -267,6 +267,8 @@ examples:
                            help="Override samples per pixel")
     overrides.add_argument("--resolution", "-r", default=None, metavar="WxH",
                            help="Override resolution (e.g. 1920x1080 or 1920,1080)")
+    overrides.add_argument("--scale", type=float, default=None, metavar="FACTOR",
+                           help="Scale scene resolution by FACTOR (e.g. 0.5 for half size); mutually exclusive with --resolution")
     overrides.add_argument("--output", "-o", default=None, metavar="FILE",
                            help="Override output filename (e.g. result.exr)")
 
@@ -286,6 +288,8 @@ examples:
                         help="Print modified scene and command without executing")
     parser.add_argument("--keep", action="store_true",
                         help="Keep the temporary scene file after rendering")
+    parser.add_argument("--save-scene", metavar="PATH",
+                        help="Save the modified .luisa scene to this path instead of a temp file")
 
     args = parser.parse_args()
     scenes_dir = REPO_ROOT / "scenes"
@@ -313,6 +317,9 @@ examples:
 
     # Parse resolution early so we can error before doing any work
     width = height = None
+    if args.resolution and args.scale is not None:
+        print("error: --resolution and --scale are mutually exclusive", file=sys.stderr)
+        return 1
     if args.resolution:
         try:
             width, height = parse_resolution(args.resolution)
@@ -320,6 +327,13 @@ examples:
             print(f"error: invalid resolution '{args.resolution}' — use WxH or W,H",
                   file=sys.stderr)
             return 1
+    elif args.scale is not None:
+        m = re.search(r'resolution\s*\{\s*(\d+)\s*,\s*(\d+)\s*\}', scene_file.read_text())
+        if not m:
+            print("error: --scale requires a resolution block in the scene file", file=sys.stderr)
+            return 1
+        width  = max(1, round(int(m.group(1)) * args.scale))
+        height = max(1, round(int(m.group(2)) * args.scale))
 
     # --- Summary ---
     print(f"scene:      {scene_file.relative_to(REPO_ROOT)}")
@@ -339,7 +353,8 @@ examples:
     if args.spp is not None:
         print(f"spp:        {args.spp}")
     if width is not None:
-        print(f"resolution: {width}x{height}")
+        scale_label = f" (scale {args.scale})" if args.scale is not None else ""
+        print(f"resolution: {width}x{height}{scale_label}")
     if args.output is not None:
         print(f"output:     {args.output}")
 
@@ -365,7 +380,11 @@ examples:
     if args.output is not None:
         content = rewrite_output_file(content, args.output)
 
-    tmp_file = write_temp_scene(scene_file, content)
+    if args.save_scene:
+        tmp_file = Path(args.save_scene)
+        tmp_file.write_text(content)
+    else:
+        tmp_file = write_temp_scene(scene_file, content)
 
     try:
         if args.dry_run:
@@ -397,7 +416,9 @@ examples:
             return 0
 
     finally:
-        if tmp_file is not None and not args.keep:
+        if tmp_file is not None and args.save_scene:
+            print(f"saved scene: {tmp_file}")
+        elif tmp_file is not None and not args.keep:
             try:
                 tmp_file.unlink()
             except OSError:
