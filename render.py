@@ -129,12 +129,22 @@ def rewrite_resolution(scene_content: str, width: int, height: int) -> str:
 
 
 def rewrite_output_file(scene_content: str, filename: str) -> str:
-    """Override the output filename in the camera block."""
-    return re.sub(
+    """Override the output filename in the camera block only."""
+    m = re.search(r'Camera\s+\w+\s*:\s*\w+\s*\{', scene_content)
+    if not m:
+        return scene_content
+    open_pos = m.end() - 1
+    close_pos = _find_balanced_brace_end(scene_content, open_pos)
+    if close_pos == -1:
+        return scene_content
+    camera_block = scene_content[open_pos : close_pos + 1]
+    new_camera_block = re.sub(
         r'(file\s*\{\s*)"[^"]*"(\s*\})',
         rf'\g<1>"{filename}"\2',
-        scene_content,
+        camera_block,
+        count=1,
     )
+    return scene_content[:open_pos] + new_camera_block + scene_content[close_pos + 1:]
 
 
 def write_temp_scene(scene_file: Path, content: str) -> Path:
