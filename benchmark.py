@@ -395,7 +395,7 @@ def main():
         csv_path = Path(args.output)
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "scene", "integrator", "samples_per_pass",
+                "scene", "integrator", "samples_per_pass", "ser_config",
                 "use_ser", "ser_hit", "ser_material", "ser_rr",
                 "render_ms", "compile_ms", "wall_ms", "status",
             ])
