@@ -1,5 +1,6 @@
 scenes/
 benchmark_results.csv
+benchmark_visualization.png
 __pycache__/
 
 ### VisualStudioCode template
