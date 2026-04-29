@@ -28,8 +28,17 @@ INTEGRATOR_DEFAULTS = {
     "rr_threshold": 0.95,
 }
 
-MEGAPATH_SPP_VALUES = [1, 2, 4, 8]
-MEGAPATH_SER_VALUES = [True, False]
+SPECTRUM_VALUES = ["sRGB", "Hero"]
+
+# (use_ser, ser_hit, ser_material, ser_rr, label)
+MEGAPATH_CONFIGS = [
+    (False, None,  None,  None,  "ser=off"),
+    (True,  False, False, False, "ser hints=none"),
+    (True,  True,  False, False, "ser hint=hit"),
+    (True,  False, True,  False, "ser hint=material"),
+    (True,  False, False, True,  "ser hint=rr"),
+    (True,  True,  True,  True,  "ser hints=all"),
+]
 
 
 def find_scenes(scenes_dir: Path, filter_names: list[str] | None = None) -> list[Path]:
@@ -53,8 +62,10 @@ def scene_display_name(scenes_dir: Path, scene_file: Path) -> str:
 
 
 def make_integrator_block(integrator_type: str, samples_per_pass: int | None = None,
-                          use_ser: bool | None = None) -> str:
+                          use_ser: bool | None = None, ser_hit: bool | None = None,
+                          ser_material: bool | None = None, ser_rr: bool | None = None) -> str:
     """Generate an integrator block string."""
+    def b(v): return "true" if v else "false"
     lines = [f"  integrator : {integrator_type} {{"]
     lines.append("    sampler : Independent {}")
     lines.append(f"    depth {{ {INTEGRATOR_DEFAULTS['depth']} }}")
@@ -63,7 +74,13 @@ def make_integrator_block(integrator_type: str, samples_per_pass: int | None = N
     if samples_per_pass is not None:
         lines.append(f"    samples_per_pass {{ {samples_per_pass} }}")
     if use_ser is not None:
-        lines.append(f"    use_ser {{ {'true' if use_ser else 'false'} }}")
+        lines.append(f"    use_ser {{ {b(use_ser)} }}")
+    if ser_hit is not None:
+        lines.append(f"    ser_hit {{ {b(ser_hit)} }}")
+    if ser_material is not None:
+        lines.append(f"    ser_material {{ {b(ser_material)} }}")
+    if ser_rr is not None:
+        lines.append(f"    ser_rr {{ {b(ser_rr)} }}")
     lines.append("  }")
     return "\n".join(lines)
 
@@ -137,6 +154,11 @@ def rewrite_spp(scene_content: str, spp: int) -> str:
     """Override spp value in scene file."""
     # Replace spp { N } pattern
     return re.sub(r'spp\s*\{\s*\d+\s*\}', f'spp {{ {spp} }}', scene_content)
+
+
+def rewrite_spectrum(scene_content: str, spectrum: str) -> str:
+    """Override spectrum type (e.g. 'sRGB' or 'Hero') in scene file."""
+    return re.sub(r'spectrum\s*:\s*\w+\s*\{\s*\}', f'spectrum : {spectrum} {{}}', scene_content)
 
 
 def write_temp_scene(scene_file: Path, content: str) -> Path:
@@ -226,9 +248,9 @@ def print_table(results: list[dict]):
     """Print results as a formatted table."""
     if not results:
         return
-    headers = ["Scene", "Integrator", "spp_per_pass", "use_ser",
+    headers = ["Scene", "Integrator", "Spectrum", "spp_per_pass", "ser_config",
                "Render", "Compile", "Wall", "Status"]
-    keys = ["scene", "integrator", "samples_per_pass", "use_ser",
+    keys = ["scene", "integrator", "spectrum", "samples_per_pass", "ser_config",
             "render_ms", "compile_ms", "wall_ms", "status"]
     col_widths = [max(len(headers[i]), max(len(str(r.get(k, ""))) for r in results))
                   for i, k in enumerate(keys)]
@@ -241,9 +263,9 @@ def print_table(results: list[dict]):
     print("-+-".join("-" * w for w in col_widths))
     for r in results:
         print(fmt_row([
-            r['scene'], r['integrator'],
+            r['scene'], r['integrator'], r.get('spectrum', '-'),
             r.get('samples_per_pass', '-'),
-            r.get('use_ser', '-'),
+            r.get('ser_config', '-'),
             _fmt_ms(r.get('render_ms')),
             _fmt_ms(r.get('compile_ms')),
             _fmt_ms(r.get('wall_ms')),
@@ -263,8 +285,6 @@ def main():
     parser.add_argument("--binary", type=str, default=None, help="Path to luisa-render-cli binary")
     parser.add_argument("--no-sweep", action="store_true",
                         help="Skip MegaPath parameter sweep, only run defaults")
-    parser.add_argument("--spp-values", nargs="*", type=int, default=MEGAPATH_SPP_VALUES,
-                        help="samples_per_pass values to sweep (default: 1 2 4 8)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     args = parser.parse_args()
 
@@ -296,75 +316,77 @@ def main():
             name = scene_display_name(scenes_dir, scene_file)
             original = scene_file.read_text()
 
-            # --- WavePath ---
-            print(f"[{name}] WavePath ...", end=" ", flush=True)
-            integrator_block = make_integrator_block("WavePath")
-            modified = rewrite_scene(original, integrator_block)
-            if args.spp:
-                modified = rewrite_spp(modified, args.spp)
-            tmp = write_temp_scene(scene_file, modified)
-            tmp_files.append(tmp)
-
-            if args.dry_run:
-                print(f"(dry run) cmd: {binary} -b {args.backend} --scene {tmp}")
-            else:
-                r = run_render(binary, args.backend, tmp, args.device, args.timeout)
-                status = "ok" if r["ok"] else ("TIMEOUT" if r.get("timeout") else "FAIL")
-                render_str = _fmt_ms(r.get("render_ms")) if r.get("render_ms") else f"{r['elapsed']:.1f}s (wall)"
-                print(f"{render_str} [{status}]")
-                if not r["ok"]:
-                    print_render_failure(r)
-                results.append({
-                    "scene": name, "integrator": "WavePath",
-                    "samples_per_pass": "-", "use_ser": "-",
-                    "render_ms": r.get("render_ms"),
-                    "compile_ms": r.get("compile_ms"),
-                    "wall_ms": r["elapsed"] * 1000,
-                    "status": status,
-                })
-
-            # --- MegaPath runs ---
-            if args.no_sweep:
-                # Single MegaPath run with defaults
-                configs = [(1, True)]
-            else:
-                configs = [
-                    (spp_val, ser_val)
-                    for spp_val in args.spp_values
-                    for ser_val in MEGAPATH_SER_VALUES
-                ]
-
-            for spp_val, ser_val in configs:
-                label = f"MegaPath spp_pass={spp_val} ser={ser_val}"
-                print(f"[{name}] {label} ...", end=" ", flush=True)
-                integrator_block = make_integrator_block(
-                    "MegaPath", samples_per_pass=spp_val, use_ser=ser_val
-                )
+            for spectrum in SPECTRUM_VALUES:
+                # --- WavePath ---
+                print(f"[{name}] WavePath spectrum={spectrum} ...", end=" ", flush=True)
+                integrator_block = make_integrator_block("WavePath")
                 modified = rewrite_scene(original, integrator_block)
+                modified = rewrite_spectrum(modified, spectrum)
                 if args.spp:
                     modified = rewrite_spp(modified, args.spp)
                 tmp = write_temp_scene(scene_file, modified)
                 tmp_files.append(tmp)
 
                 if args.dry_run:
-                    print(f"(dry run)")
+                    print(f"(dry run) cmd: {binary} -b {args.backend} --scene {tmp}")
                 else:
-                    r = run_render(
-                        binary, args.backend, tmp, args.device, args.timeout
-                    )
+                    r = run_render(binary, args.backend, tmp, args.device, args.timeout)
                     status = "ok" if r["ok"] else ("TIMEOUT" if r.get("timeout") else "FAIL")
                     render_str = _fmt_ms(r.get("render_ms")) if r.get("render_ms") else f"{r['elapsed']:.1f}s (wall)"
                     print(f"{render_str} [{status}]")
                     if not r["ok"]:
                         print_render_failure(r)
                     results.append({
-                        "scene": name, "integrator": "MegaPath",
-                        "samples_per_pass": spp_val, "use_ser": ser_val,
+                        "scene": name, "integrator": "WavePath", "spectrum": spectrum,
+                        "samples_per_pass": "-", "ser_config": "-",
+                        "use_ser": "-", "ser_hit": "-", "ser_material": "-", "ser_rr": "-",
                         "render_ms": r.get("render_ms"),
                         "compile_ms": r.get("compile_ms"),
                         "wall_ms": r["elapsed"] * 1000,
                         "status": status,
                     })
+
+                # --- MegaPath runs ---
+                if args.no_sweep:
+                    configs = [(True, True, True, True, "ser hints=all")]
+                else:
+                    configs = MEGAPATH_CONFIGS
+
+                for use_ser, ser_hit, ser_material, ser_rr, ser_label in configs:
+                    label = f"MegaPath {ser_label} spectrum={spectrum}"
+                    print(f"[{name}] {label} ...", end=" ", flush=True)
+                    integrator_block = make_integrator_block(
+                        "MegaPath", samples_per_pass=1,
+                        use_ser=use_ser, ser_hit=ser_hit, ser_material=ser_material, ser_rr=ser_rr,
+                    )
+                    modified = rewrite_scene(original, integrator_block)
+                    modified = rewrite_spectrum(modified, spectrum)
+                    if args.spp:
+                        modified = rewrite_spp(modified, args.spp)
+                    tmp = write_temp_scene(scene_file, modified)
+                    tmp_files.append(tmp)
+
+                    if args.dry_run:
+                        print(f"(dry run)")
+                    else:
+                        r = run_render(
+                            binary, args.backend, tmp, args.device, args.timeout
+                        )
+                        status = "ok" if r["ok"] else ("TIMEOUT" if r.get("timeout") else "FAIL")
+                        render_str = _fmt_ms(r.get("render_ms")) if r.get("render_ms") else f"{r['elapsed']:.1f}s (wall)"
+                        print(f"{render_str} [{status}]")
+                        if not r["ok"]:
+                            print_render_failure(r)
+                        results.append({
+                            "scene": name, "integrator": "MegaPath", "spectrum": spectrum,
+                            "samples_per_pass": 1, "ser_config": ser_label,
+                            "use_ser": use_ser, "ser_hit": ser_hit,
+                            "ser_material": ser_material, "ser_rr": ser_rr,
+                            "render_ms": r.get("render_ms"),
+                            "compile_ms": r.get("compile_ms"),
+                            "wall_ms": r["elapsed"] * 1000,
+                            "status": status,
+                        })
 
     except KeyboardInterrupt:
         print("\nInterrupted!")
@@ -383,7 +405,8 @@ def main():
         csv_path = Path(args.output)
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "scene", "integrator", "samples_per_pass", "use_ser",
+                "scene", "integrator", "spectrum", "samples_per_pass", "ser_config",
+                "use_ser", "ser_hit", "ser_material", "ser_rr",
                 "render_ms", "compile_ms", "wall_ms", "status",
             ])
             writer.writeheader()

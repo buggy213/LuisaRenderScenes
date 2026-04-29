@@ -7,6 +7,8 @@ dependencies = [
     "imageio",
     "scikit-image",
     "opencv-python",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.2",
 ]
 
 [tool.uv]
