@@ -1,0 +1,13 @@
+[project]
+name = "luisa-render-scenes"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "imageio",
+    "scikit-image",
+    "opencv-python",
+]
+
+[tool.uv]
+dev-dependencies = []
