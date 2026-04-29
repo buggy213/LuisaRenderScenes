@@ -128,6 +128,10 @@ def rewrite_resolution(scene_content: str, width: int, height: int) -> str:
     )
 
 
+def rewrite_spectrum(scene_content: str, spectrum: str) -> str:
+    return re.sub(r'spectrum\s*:\s*\w+\s*\{\s*\}', f'spectrum : {spectrum} {{}}', scene_content)
+
+
 def rewrite_output_file(scene_content: str, filename: str) -> str:
     """Override the output filename in the camera block only."""
     m = re.search(r'Camera\s+\w+\s*:\s*\w+\s*\{', scene_content)
@@ -281,6 +285,9 @@ examples:
                            help="Scale scene resolution by FACTOR (e.g. 0.5 for half size); mutually exclusive with --resolution")
     overrides.add_argument("--output", "-o", default=None, metavar="FILE",
                            help="Override output filename (e.g. result.exr)")
+    overrides.add_argument("--spectrum", default=None,
+                           choices=["sRGB", "Hero"],
+                           help="Override spectrum type (sRGB or Hero)")
 
     # --- Backend ---
     backend = parser.add_argument_group("backend")
@@ -367,6 +374,8 @@ examples:
         print(f"resolution: {width}x{height}{scale_label}")
     if args.output is not None:
         print(f"output:     {args.output}")
+    if args.spectrum is not None:
+        print(f"spectrum:   {args.spectrum}")
 
     # --- Rewrite scene ---
     integrator_block = make_integrator_block(
@@ -389,6 +398,8 @@ examples:
         content = rewrite_resolution(content, width, height)
     if args.output is not None:
         content = rewrite_output_file(content, args.output)
+    if args.spectrum is not None:
+        content = rewrite_spectrum(content, args.spectrum)
 
     if args.save_scene:
         tmp_file = Path(args.save_scene)
